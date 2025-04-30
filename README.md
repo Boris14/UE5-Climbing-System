@@ -1,7 +1,8 @@
-# UE5TopDownARPG
-Template for a Top Down ARPG created with Unreal Engine 5.
+# UE5-Climbing-System
 
-Part of the learning materials for the course 'Game Engine Architecture with UE4' taught at the University of Sofia.
+A simple climbing system implementation in Unreal Engine 5.
+
+Project for the course 'Game Engine Architecture' at the University of Sofia.
 
 See the Game Engine Architecture lectures at
 [https://github.com/nikoladimitroff/Game-Engine-Architecture](https://github.com/nikoladimitroff/Game-Engine-Architecture)
