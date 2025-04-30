@@ -8,11 +8,16 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/SpringArmComponent.h"
+#include "Components/BoxComponent.h"
+#include "Components/ArrowComponent.h"
 #include "Materials/Material.h"
 #include "Engine/World.h"
 #include "Abilities/BaseAbility.h"
 #include "UE5TopDownARPGGameMode.h"
 #include "UE5TopDownARPG.h"
+#include "GameFramework/PhysicsVolume.h"
+#include "DrawDebugHelpers.h"
+#include "Engine/SkeletalMeshSocket.h"
 #include "Net/UnrealNetwork.h"
 
 AUE5TopDownARPGCharacter::AUE5TopDownARPGCharacter()
@@ -31,12 +36,21 @@ AUE5TopDownARPGCharacter::AUE5TopDownARPGCharacter()
 	GetCharacterMovement()->bConstrainToPlane = true;
 	GetCharacterMovement()->bSnapToPlaneAtStart = true;
 
+	ClimbingBoxComponent = CreateDefaultSubobject<UBoxComponent>(TEXT("ClimbingBoxComponent"));
+	ClimbingBoxComponent->SetupAttachment(RootComponent);
+	ClimbingBoxComponent->SetCollisionResponseToChannel(ECollisionChannel::ECC_WorldStatic, ECollisionResponse::ECR_Overlap);
+	ClimbingBoxComponent->SetGenerateOverlapEvents(true);
+
+	ClimbJumpArrowComponent = CreateDefaultSubobject<UArrowComponent>(TEXT("ClimbJumpArrowComponent"));
+	ClimbJumpArrowComponent->SetupAttachment(RootComponent);
+	ClimbJumpArrowComponent->ArrowLength = ClimbJumpArrowMaxLength;
+
 	// Create a camera boom...
 	CameraBoom = CreateDefaultSubobject<USpringArmComponent>(TEXT("CameraBoom"));
 	CameraBoom->SetupAttachment(RootComponent);
 	CameraBoom->SetUsingAbsoluteRotation(true); // Don't want arm to rotate when character does
-	CameraBoom->TargetArmLength = 800.f;
-	CameraBoom->SetRelativeRotation(FRotator(-60.f, 0.f, 0.f));
+	CameraBoom->TargetArmLength = OriginalCameraDistance;
+	CameraBoom->SetRelativeRotation(FRotator(OriginalCameraPitch, 0.f, 0.f));
 	CameraBoom->bDoCollisionTest = false; // Don't want to pull camera in when it collides with level
 
 	// Create a camera...
@@ -47,13 +61,28 @@ AUE5TopDownARPGCharacter::AUE5TopDownARPGCharacter()
 	// Activate ticking in order to update the cursor every frame.
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = true;
-
-	OnTakeAnyDamage.AddDynamic(this, &AUE5TopDownARPGCharacter::TakeAnyDamage);
 }
 
 void AUE5TopDownARPGCharacter::BeginPlay()
 {
 	Super::BeginPlay();
+
+	USkeletalMeshComponent* CharacterMesh = GetMesh();
+	if (IsValid(CharacterMesh) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGCharacter::BeginPlay IsValid(Mesh) == false"));
+		return;
+	}
+	FVector GrabSocketLocation = CharacterMesh->GetSocketLocation(GrabSocketName);
+	FVector GrabRelativeLocation = GrabSocketLocation - GetActorLocation();
+	ClimbJumpArrowComponent->SetRelativeLocation(GrabRelativeLocation);
+	ClimbJumpArrowComponent->SetVisibility(false);
+
+	OnTakeAnyDamage.AddDynamic(this, &AUE5TopDownARPGCharacter::TakeAnyDamage);
+
+	FScriptDelegate OnClimbingComponentBeginOverlapDelegate;
+	OnClimbingComponentBeginOverlapDelegate.BindUFunction(this, "OnClimbingComponentBeginOverlap");
+	ClimbingBoxComponent->OnComponentBeginOverlap.AddUnique(OnClimbingComponentBeginOverlapDelegate);
 	
 	if (AbilityTemplate != nullptr)
 	{
@@ -65,18 +94,67 @@ void AUE5TopDownARPGCharacter::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
 
-		/*
-		FHitResult HitResult;
-		FVector TraceStartLocation = GetActorLocation();
-		FVector TraceEndLocation = GetActorLocation() + GetActorForwardVector() * 300.0f;
-		FCollisionQueryParams Params;
-		Params.AddIgnoredActor(this);
+	USkeletalMeshComponent* CharacterMesh = GetMesh();
+	if (IsValid(CharacterMesh) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGCharacter::Tick IsValid(Mesh) == false"));
+		return;
+	}
 
-		if (GetWorld()->LineTraceSingleByChannel(HitResult, TraceStartLocation, TraceEndLocation, ECollisionChannel::ECC_WorldDynamic, Params))
+	const FVector& GrabSocketLocation = CharacterMesh->GetSocketLocation(GrabSocketName);
+	FRotator CameraBoomRotation = CameraBoom->GetComponentRotation();
+	float CameraDistance = CameraBoom->TargetArmLength;
+	if (IsValid(GrabbedHold))
+	{
+		const FVector& HoldLocation = GrabbedHold->GetActorLocation();
+		const FVector& ForwardVector = GetActorForwardVector();
+
+		// Set the Location of the Hands for the IK Goals
+		IKRightHandWorldLocation = HoldLocation + FRotator(0.f, 90.f, 0.f).RotateVector(ForwardVector) * 20;
+		IKLeftHandWorldLocation = HoldLocation + FRotator(0.f, -90.f, 0.f).RotateVector(ForwardVector) * 20;
+
+		// Move the Character to simulate that he's pulling himself to the Grabbed Hold
+		float HoldDistance = FVector::Distance(GrabSocketLocation, HoldLocation);
+		if (HoldDistance > GrabDistanceTreshold)
 		{
-			UE_LOG(LogUE5TopDownARPG, Log, TEXT("TraceHit %s %s"), *HitResult.GetActor()->GetName(), *HitResult.GetComponent()->GetName());
+			GetCharacterMovement()->StopMovementImmediately();
+			const FVector& NewGrabSocketLocation = FMath::VInterpTo(GrabSocketLocation, HoldLocation, DeltaSeconds, PullToHoldForce);
+			const FVector& LocationOffset = NewGrabSocketLocation - GrabSocketLocation;
+			SetActorLocation(GetActorLocation() + LocationOffset);
 		}
-		*/
+
+		// Adjust the Rotation of the Character to he faces the Wall
+		const FRotator& FaceWallRotation = GetFaceWallRotation();
+		if (GetActorRotation().Equals(FaceWallRotation) == false)
+		{
+			FRotator NewRotation = FMath::RInterpTo(GetActorRotation(), FaceWallRotation, DeltaSeconds, PullToHoldForce);
+			SetActorRotation(NewRotation);
+		}
+
+		// Adjust the Camera for Climbing
+		if (FMath::IsNearlyEqual(CameraBoomRotation.Pitch, ClimbCameraPitch) == false)
+		{
+			CameraBoomRotation.Pitch = FMath::FInterpTo(CameraBoomRotation.Pitch, ClimbCameraPitch, DeltaSeconds, PullToHoldForce);
+			CameraBoom->SetWorldRotation(CameraBoomRotation);
+		}
+		if (FMath::IsNearlyEqual(CameraDistance, ClimbCameraDistance) == false)
+		{
+			CameraBoom->TargetArmLength = FMath::FInterpTo(CameraDistance, ClimbCameraDistance, DeltaSeconds, PullToHoldForce);
+		}
+	}
+	else
+	{
+		// Adjust the Camera for Walking
+		if (FMath::IsNearlyEqual(CameraBoomRotation.Pitch, OriginalCameraPitch) == false)
+		{
+			CameraBoomRotation.Pitch = FMath::FInterpTo(CameraBoomRotation.Pitch, OriginalCameraPitch, DeltaSeconds, PullToHoldForce);
+			CameraBoom->SetWorldRotation(CameraBoomRotation);
+		}
+		if (FMath::IsNearlyEqual(CameraDistance, OriginalCameraDistance) == false)
+		{
+			CameraBoom->TargetArmLength = FMath::FInterpTo(CameraDistance, OriginalCameraDistance, DeltaSeconds, PullToHoldForce);
+		}
+	}
 }
 
 void AUE5TopDownARPGCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -84,6 +162,29 @@ void AUE5TopDownARPGCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProper
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	DOREPLIFETIME(AUE5TopDownARPGCharacter, Health);
+}
+
+void AUE5TopDownARPGCharacter::SetIsJumpArrowVisible(bool IsVisible)
+{
+	if (IsValid(ClimbJumpArrowComponent) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGCharacter::SetIsJumpArrowVisible IsValid(ClimbJumpArrowComponent) == false"));
+		return;
+	}
+
+	ClimbJumpArrowComponent->SetVisibility(IsVisible);
+}
+
+void AUE5TopDownARPGCharacter::UpdateJumpArrow(const FVector2D& Direction, float MaxLengthFraction)
+{
+	if (IsValid(ClimbJumpArrowComponent) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGCharacter::UpdateJumpArrowProperties IsValid(ClimbJumpArrowComponent) == false"));
+		return;
+	}
+
+	ClimbJumpArrowComponent->SetWorldScale3D(FVector(MaxLengthFraction,1.f,1.f));
+	ClimbJumpArrowComponent->SetRelativeRotation(FVector(0.f, Direction.X, Direction.Y).ToOrientationRotator());
 }
 
 bool AUE5TopDownARPGCharacter::ActivateAbility(FVector Location)
@@ -110,11 +211,79 @@ void AUE5TopDownARPGCharacter::TakeAnyDamage(AActor* DamagedActor, float Damage,
 	}
 }
 
+void AUE5TopDownARPGCharacter::OnClimbingComponentBeginOverlap(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor, 
+	UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
+{
+	if (IsValid(OtherActor) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGCharacter::OnClimbingComponentBeginOverlap IsValid(OtherActor) == false"));
+		return;
+	}
+
+	if (OtherActor->ActorHasTag(ClimbingHoldsActorTag) && GetCharacterMovement()->IsFalling())
+	{
+		GrabHold(OtherActor, OtherActor->GetActorLocation());
+	}
+}
+
 void AUE5TopDownARPGCharacter::OnRep_SetHealth(float OldHealth)
 {
 	if (GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(-1, 15.0f, FColor::Yellow, FString::Printf(TEXT("Health %f"), Health));
+	}
+}
+
+void AUE5TopDownARPGCharacter::GrabHold(AActor* Hold, const FVector& OverlapLocation)
+{
+	if (IsValid(Hold) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGCharacter::GrabHold IsValid(Hold) == false"));
+		return;
+	}
+
+	GetCharacterMovement()->SetMovementMode(EMovementMode::MOVE_Flying);
+	GrabbedHold = Hold;
+
+	OnHoldGrabbedDelegate.ExecuteIfBound(Hold);
+}
+
+void AUE5TopDownARPGCharacter::ReleaseHold()
+{
+	if (IsValid(GrabbedHold))
+	{
+		OnHoldReleasedDelegate.ExecuteIfBound(GrabbedHold);
+		GrabbedHold = nullptr;
+		GetCharacterMovement()->SetMovementMode(EMovementMode::MOVE_Walking);
+	}
+}
+
+FRotator AUE5TopDownARPGCharacter::GetFaceWallRotation() const
+{
+	UWorld* World = GetWorld();
+	if(IsValid(World) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGCharacter::GetNormalVectorFromWall IsValid(World) == false"));
+		return FRotator::ZeroRotator;
+	}
+	const FVector Start = GetActorLocation();
+	const FVector End = Start + GetActorForwardVector() * ClimbingBoxComponent->GetScaledBoxExtent().Y * 1.5;
+	FCollisionQueryParams QueryParams;
+	QueryParams.AddIgnoredActor(this);
+	FHitResult Hit;
+	World->LineTraceSingleByChannel(Hit, Start, End, ECollisionChannel::ECC_WorldStatic, QueryParams);
+
+	const FVector Direction = -Hit.ImpactNormal;
+	return Direction.ToOrientationRotator();
+}
+
+void AUE5TopDownARPGCharacter::ClimbJump(FVector2D InDirection, float MaxForceFraction)
+{
+	if (IsValid(GrabbedHold))
+	{
+		ReleaseHold();
+		FVector JumpDirection = FVector{ 0.f, InDirection.X, InDirection.Y };
+		GetCharacterMovement()->AddImpulse(JumpDirection * GetCharacterMovement()->Mass * ClimbJumpMaxForce * MaxForceFraction);
 	}
 }
 

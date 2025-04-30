@@ -10,60 +10,83 @@
 
 /** Forward declaration to improve compiling times */
 class UNiagaraSystem;
+class UInputAction;
+class APawn;
+class UEnhancedInputLocalPlayerSubsystem;
+struct FInputActionInstance;
 
 UCLASS()
 class AUE5TopDownARPGPlayerController : public APlayerController
 {
 	GENERATED_BODY()
 
-public:
-	AUE5TopDownARPGPlayerController();
-
-	/** Time Threshold to know if it was a short press */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = Input)
-	float ShortPressThreshold;
-
-	/** FX Class that we will spawn when clicking */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = Input)
-	UNiagaraSystem* FXCursor;
-
-	/** MappingContext */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category=Input, meta=(AllowPrivateAccess = "true"))
-	class UInputMappingContext* DefaultMappingContext;
-	
-	/** Jump Input Action */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category=Input, meta=(AllowPrivateAccess = "true"))
-	class UInputAction* SetDestinationClickAction;
-
-	/** Jump Input Action */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category=Input, meta=(AllowPrivateAccess = "true"))
-	class UInputAction* SetDestinationTouchAction;
-
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category=Input, meta=(AllowPrivateAccess = "true"))
-	class UInputAction* ActivateAbilityAction;
-
 protected:
-	/** True if the controlled character should navigate to the mouse cursor. */
-	uint32 bMoveToMouseCursor : 1;
-
 	virtual void SetupInputComponent() override;
-	
 	// To add mapping context
-	virtual void BeginPlay();
+	virtual void BeginPlay() override;
+	virtual void OnPossess(APawn* InPawn) override;
+	virtual void Tick(float DeltaSeconds) override;
 
-	/** Input handlers for SetDestination action. */
-	void OnInputStarted();
-	void OnSetDestinationTriggered();
-	void OnSetDestinationReleased();
-	void OnTouchTriggered();
-	void OnTouchReleased();
 	void OnActivateAbilityStarted();
 
-private:
-	FVector CachedDestination;
+	UFUNCTION()
+	void OnMoveInputTriggered(const FInputActionInstance& Instance);
 
-	bool bIsTouch; // Is it a touch device
-	float FollowTime; // For how long it has been pressed
+	UFUNCTION()
+	void OnJumpInputTriggered(const FInputActionInstance& Instance);
+
+	UFUNCTION()
+	void OnClimbJumpPressed(const FInputActionInstance& Instance);
+
+	UFUNCTION()
+	void OnClimbJumpReleased(const FInputActionInstance& Instance);
+
+	UFUNCTION()
+	void OnLookAtTriggered(const FInputActionInstance& Instance);
+
+	UFUNCTION()
+	void OnLookAtCompleted(const FInputActionInstance& Instance);
+
+private:
+	UFUNCTION()
+	void OnCharacterHoldGrabbed(AActor* Hold);
+
+	UFUNCTION()
+	void OnCharacterHoldReleased(AActor* Hold);
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input", meta = (AllowPrivateAccess = "true"))
+	class UInputMappingContext* DefaultMappingContext;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input|Climbing", meta = (AllowPrivateAccess = "true"))
+	class UInputMappingContext* ClimbMappingContext;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input", meta = (AllowPrivateAccess = "true"))
+	UInputAction* ActivateAbilityAction;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input", meta = (AllowPrivateAccess = "true"))
+	UInputAction* MoveInputAction;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input", meta = (AllowPrivateAccess = "true"))
+	UInputAction* JumpInputAction;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input|Climbing", meta = (AllowPrivateAccess = "true"))
+	UInputAction* ClimbJumpInputAction;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input|Climbing", meta = (AllowPrivateAccess = "true"))
+	UInputAction* LookAtInputAction;
+
+	UPROPERTY()
+	UEnhancedInputLocalPlayerSubsystem* InputSubsystem;
+
+	/* Determines how much the side jump is actually to the side */
+	UPROPERTY(EditDefaultsOnly, Category = Climbing)
+	float ClimbJumpShrinkSideRangeMultiplier = 0.8f;
+	UPROPERTY(EditDefaultsOnly, Category = Climbing)
+	float ClimbJumpMinForceFraction = 0.2f;
+	/* The Direction used when doing a ClimbJump. (1,0) = Right; (0,1) = Up; (-1,0) = Left */
+	FVector2D ClimbJumpDirection;
+	float ClimbJumpForceFraction = 0.2f;
+	bool IsChargingJump = false;
 };
 
 

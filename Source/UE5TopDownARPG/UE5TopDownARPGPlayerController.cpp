@@ -9,15 +9,8 @@
 #include "Engine/World.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
+#include "GameFramework/PawnMovementComponent.h"
 #include "UE5TopDownARPG.h"
-
-AUE5TopDownARPGPlayerController::AUE5TopDownARPGPlayerController()
-{
-	bShowMouseCursor = true;
-	DefaultMouseCursor = EMouseCursor::Default;
-	CachedDestination = FVector::ZeroVector;
-	FollowTime = 0.f;
-}
 
 void AUE5TopDownARPGPlayerController::BeginPlay()
 {
@@ -25,9 +18,48 @@ void AUE5TopDownARPGPlayerController::BeginPlay()
 	Super::BeginPlay();
 
 	//Add Input Mapping Context
-	if (UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(GetLocalPlayer()))
+	InputSubsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(GetLocalPlayer());
+	if (IsValid(InputSubsystem) == false)
 	{
-		Subsystem->AddMappingContext(DefaultMappingContext, 0);
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::BeginPlay IsValid(InputSubsystem) == false"));
+		return;
+	}
+	InputSubsystem->AddMappingContext(DefaultMappingContext, 0);
+}
+
+void AUE5TopDownARPGPlayerController::OnPossess(APawn* InPawn)
+{
+	Super::OnPossess(InPawn);
+
+	AUE5TopDownARPGCharacter* RPGCharacter = Cast<AUE5TopDownARPGCharacter>(InPawn);
+	if (IsValid(RPGCharacter) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnPossess IsValid(RPGCharacter) == false"));
+		return;
+	}
+
+	TDelegate<void(AActor*)> OnHoldGrabbedDelegate;
+	TDelegate<void(AActor*)> OnHoldReleasedDelegate;
+	OnHoldGrabbedDelegate.BindUObject(this, &AUE5TopDownARPGPlayerController::OnCharacterHoldGrabbed);
+	OnHoldReleasedDelegate.BindUObject(this, &AUE5TopDownARPGPlayerController::OnCharacterHoldReleased);
+	RPGCharacter->SetOnHoldGrabbedDelegate(OnHoldGrabbedDelegate);
+	RPGCharacter->SetOnHoldReleasedDelegate(OnHoldReleasedDelegate);
+}
+
+void AUE5TopDownARPGPlayerController::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+
+	if (IsChargingJump)
+	{
+		ClimbJumpForceFraction += DeltaSeconds * 2;
+		ClimbJumpForceFraction = FMath::Clamp(ClimbJumpForceFraction, ClimbJumpMinForceFraction, 1.f);
+
+		AUE5TopDownARPGCharacter* UECharacter = Cast<AUE5TopDownARPGCharacter>(GetPawn());
+		if (IsValid(UECharacter) && UECharacter->GetShouldDisplayClimbJumpArrow())
+		{
+			UECharacter->UpdateJumpArrow(ClimbJumpDirection, ClimbJumpForceFraction);
+		}
 	}
 }
 
@@ -39,108 +71,140 @@ void AUE5TopDownARPGPlayerController::SetupInputComponent()
 	// Set up action bindings
 	if (UEnhancedInputComponent* EnhancedInputComponent = CastChecked<UEnhancedInputComponent>(InputComponent))
 	{
-		// Setup mouse input events
-		EnhancedInputComponent->BindAction(SetDestinationClickAction, ETriggerEvent::Started, this, &AUE5TopDownARPGPlayerController::OnInputStarted);
-		EnhancedInputComponent->BindAction(SetDestinationClickAction, ETriggerEvent::Triggered, this, &AUE5TopDownARPGPlayerController::OnSetDestinationTriggered);
-		EnhancedInputComponent->BindAction(SetDestinationClickAction, ETriggerEvent::Completed, this, &AUE5TopDownARPGPlayerController::OnSetDestinationReleased);
-		EnhancedInputComponent->BindAction(SetDestinationClickAction, ETriggerEvent::Canceled, this, &AUE5TopDownARPGPlayerController::OnSetDestinationReleased);
-
+		EnhancedInputComponent->BindAction(MoveInputAction, ETriggerEvent::Triggered, this, &AUE5TopDownARPGPlayerController::OnMoveInputTriggered);
+		EnhancedInputComponent->BindAction(JumpInputAction, ETriggerEvent::Triggered, this, &AUE5TopDownARPGPlayerController::OnJumpInputTriggered);
+		EnhancedInputComponent->BindAction(ClimbJumpInputAction, ETriggerEvent::Started, this, &AUE5TopDownARPGPlayerController::OnClimbJumpPressed);
+		EnhancedInputComponent->BindAction(ClimbJumpInputAction, ETriggerEvent::Completed, this, &AUE5TopDownARPGPlayerController::OnClimbJumpReleased);
+		EnhancedInputComponent->BindAction(LookAtInputAction, ETriggerEvent::Triggered, this, &AUE5TopDownARPGPlayerController::OnLookAtTriggered);
+		EnhancedInputComponent->BindAction(LookAtInputAction, ETriggerEvent::Completed, this, &AUE5TopDownARPGPlayerController::OnLookAtCompleted);
 		EnhancedInputComponent->BindAction(ActivateAbilityAction, ETriggerEvent::Started, this, &AUE5TopDownARPGPlayerController::OnActivateAbilityStarted);
-
-		// Setup touch input events
-		EnhancedInputComponent->BindAction(SetDestinationTouchAction, ETriggerEvent::Started, this, &AUE5TopDownARPGPlayerController::OnInputStarted);
-		EnhancedInputComponent->BindAction(SetDestinationTouchAction, ETriggerEvent::Triggered, this, &AUE5TopDownARPGPlayerController::OnTouchTriggered);
-		EnhancedInputComponent->BindAction(SetDestinationTouchAction, ETriggerEvent::Completed, this, &AUE5TopDownARPGPlayerController::OnTouchReleased);
-		EnhancedInputComponent->BindAction(SetDestinationTouchAction, ETriggerEvent::Canceled, this, &AUE5TopDownARPGPlayerController::OnTouchReleased);
 	}
-}
-
-void AUE5TopDownARPGPlayerController::OnInputStarted()
-{
-	StopMovement();
-}
-
-// Triggered every frame when the input is held down
-void AUE5TopDownARPGPlayerController::OnSetDestinationTriggered()
-{
-	// We flag that the input is being pressed
-	FollowTime += GetWorld()->GetDeltaSeconds();
-	
-	// We look for the location in the world where the player has pressed the input
-	FHitResult Hit;
-	bool bHitSuccessful = false;
-	if (bIsTouch)
-	{
-		bHitSuccessful = GetHitResultUnderFinger(ETouchIndex::Touch1, ECollisionChannel::ECC_Visibility, true, Hit);
-	}
-	else
-	{
-		bHitSuccessful = GetHitResultUnderCursor(ECollisionChannel::ECC_Visibility, true, Hit);
-	}
-
-	// If we hit a surface, cache the location
-	if (bHitSuccessful)
-	{
-		CachedDestination = Hit.Location;
-	}
-	
-	// Move towards mouse pointer or touch
-	APawn* ControlledPawn = GetPawn();
-	if (ControlledPawn != nullptr)
-	{
-		FVector WorldDirection = (CachedDestination - ControlledPawn->GetActorLocation()).GetSafeNormal();
-		ControlledPawn->AddMovementInput(WorldDirection, 1.0, false);
-	}
-}
-
-void AUE5TopDownARPGPlayerController::OnSetDestinationReleased()
-{
-	// If it was a short press
-	if (FollowTime <= ShortPressThreshold)
-	{
-		// We move there and spawn some particles
-		UAIBlueprintHelperLibrary::SimpleMoveToLocation(this, CachedDestination);
-		UNiagaraFunctionLibrary::SpawnSystemAtLocation(this, FXCursor, CachedDestination, FRotator::ZeroRotator, FVector(1.f, 1.f, 1.f), true, true, ENCPoolMethod::None, true);
-	}
-
-	FollowTime = 0.f;
-}
-
-// Triggered every frame when the input is held down
-void AUE5TopDownARPGPlayerController::OnTouchTriggered()
-{
-	bIsTouch = true;
-	OnSetDestinationTriggered();
-}
-
-void AUE5TopDownARPGPlayerController::OnTouchReleased()
-{
-	bIsTouch = false;
-	OnSetDestinationReleased();
 }
 
 void AUE5TopDownARPGPlayerController::OnActivateAbilityStarted()
 {
 	UE_LOG(LogUE5TopDownARPG, Log, TEXT("OnActivateAbilityStarted"));
 
-	AUE5TopDownARPGCharacter* ARPGCharacter = Cast<AUE5TopDownARPGCharacter>(GetPawn());
-	if (IsValid(ARPGCharacter))
+	AUE5TopDownARPGCharacter* UECharacter = Cast<AUE5TopDownARPGCharacter>(GetPawn());
+	if (IsValid(UECharacter))
 	{
 		FHitResult Hit;
-		bool bHitSuccessful = false;
-		if (bIsTouch)
-		{
-			bHitSuccessful = GetHitResultUnderFinger(ETouchIndex::Touch1, ECollisionChannel::ECC_Visibility, true, Hit);
-		}
-		else
-		{
-			bHitSuccessful = GetHitResultUnderCursor(ECollisionChannel::ECC_Visibility, true, Hit);
-		}
 
 		// If we hit a surface, cache the location
-		if (bHitSuccessful)
+		if (GetHitResultUnderCursor(ECollisionChannel::ECC_Visibility, true, Hit))
 		{
-			ARPGCharacter->ActivateAbility(Hit.Location);
+			UECharacter->ActivateAbility(Hit.Location);
 		}
 	}
+}
+
+void AUE5TopDownARPGPlayerController::OnMoveInputTriggered(const FInputActionInstance& Instance)
+{
+	const FInputActionValue& InputValue = Instance.GetValue();
+	if (InputValue.GetValueType() != EInputActionValueType::Axis2D)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnMoveInputTriggered InputValue.GetValueType() != EInputActionValueType::Axis2D"));
+		return;
+	}
+
+	const FVector2D& Value = InputValue.Get<FVector2D>();
+	FVector MoveDirection{ Value.Y, Value.X, 0.f };
+
+	AUE5TopDownARPGCharacter* UECharacter = Cast<AUE5TopDownARPGCharacter>(GetPawn());
+	if (IsValid(UECharacter) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnMoveInputTriggered IsValid(UECharacter) == false"));
+		return;
+	}
+	UECharacter->AddMovementInput(MoveDirection);
+}
+
+void AUE5TopDownARPGPlayerController::OnJumpInputTriggered(const FInputActionInstance& Instance)
+{
+	AUE5TopDownARPGCharacter* UECharacter = Cast<AUE5TopDownARPGCharacter>(GetPawn());
+	if (IsValid(UECharacter) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnJumpInputTriggered IsValid(UECharacter) == false"));
+		return;
+	}
+	UECharacter->Jump();
+}
+
+void AUE5TopDownARPGPlayerController::OnClimbJumpPressed(const FInputActionInstance& Instance)
+{
+	AUE5TopDownARPGCharacter* UECharacter = Cast<AUE5TopDownARPGCharacter>(GetPawn());
+	if (IsValid(UECharacter) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnClimbJumpTriggered IsValid(RPGCharacter) == false"));
+		return;
+	}
+
+	IsChargingJump = true;
+	if (UECharacter->GetShouldDisplayClimbJumpArrow())
+	{
+		UECharacter->SetIsJumpArrowVisible(true);
+	}
+}
+
+void AUE5TopDownARPGPlayerController::OnClimbJumpReleased(const FInputActionInstance& Instance)
+{
+	AUE5TopDownARPGCharacter* UECharacter = Cast<AUE5TopDownARPGCharacter>(GetPawn());
+	if (IsValid(UECharacter) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnClimbJumpTriggered IsValid(RPGCharacter) == false"));
+		return;
+	}
+	
+	UECharacter->ClimbJump(ClimbJumpDirection, ClimbJumpForceFraction);
+	IsChargingJump = false;
+	UECharacter->SetIsJumpArrowVisible(false);
+	ClimbJumpForceFraction = ClimbJumpMinForceFraction;
+	ClimbJumpDirection = FVector2D::ZeroVector;
+}
+
+void AUE5TopDownARPGPlayerController::OnLookAtTriggered(const FInputActionInstance& Instance)
+{
+	const FVector& Value = Instance.GetValue().Get<FVector>();
+	ClimbJumpDirection = FVector2D{ Value.Y - Value.X, Value.Z };
+	ClimbJumpDirection.Y += FMath::Abs(ClimbJumpDirection.X) * ClimbJumpShrinkSideRangeMultiplier;
+	ClimbJumpDirection.Normalize();
+}
+
+void AUE5TopDownARPGPlayerController::OnLookAtCompleted(const FInputActionInstance& Instance)
+{
+	ClimbJumpDirection = FVector2D::ZeroVector;
+}
+
+void AUE5TopDownARPGPlayerController::OnCharacterHoldGrabbed(AActor* Hold)
+{
+	if (IsValid(Hold) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnCharacterHoldGrabbed IsValid(Hold) == false"));
+		return;
+	}
+	if (IsValid(InputSubsystem) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnCharacterHoldGrabbed IsValid(InputSubsystem) == false"));
+		return;
+	}
+	InputSubsystem->RemoveMappingContext(DefaultMappingContext);
+	InputSubsystem->AddMappingContext(ClimbMappingContext, 0);
+}
+
+void AUE5TopDownARPGPlayerController::OnCharacterHoldReleased(AActor* Hold)
+{
+	if (IsValid(Hold) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnCharacterHoldReleased IsValid(Hold) == false"));
+		return;
+	}
+	if (IsValid(InputSubsystem) == false)
+	{
+		UE_LOG(LogUE5TopDownARPG, Error, TEXT("AUE5TopDownARPGPlayerController::OnCharacterHoldReleased IsValid(InputSubsystem) == false"));
+		return;
+	}
+	InputSubsystem->RemoveMappingContext(ClimbMappingContext);
+	InputSubsystem->AddMappingContext(DefaultMappingContext, 0);
+
+	ClimbJumpDirection = FVector2D::ZeroVector;
 }
